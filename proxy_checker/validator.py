@@ -1,6 +1,7 @@
 """Core proxy validation logic."""
 
 import asyncio
+import logging
 import time
 from typing import Optional, Set
 
@@ -48,31 +49,34 @@ class ProxyValidator:
 
         for protocol in protocols_to_try:
             self._proxy.protocol = protocol
-            connector = self._create_connector()
+            connector = ProxyConnector.from_url(str(self._proxy))
 
             try:
-                start_time = time.monotonic()
-                async with self._session.get(
-                    TEST_URL, timeout=self._timeout, proxy=str(self._proxy)
-                ) as response:
-                    latency = (time.monotonic() - start_time) * 1000  # in ms
+                # Create a new session for each attempt to ensure proper protocol handling
+                async with ClientSession(connector=connector) as proxy_session:
+                    start_time = time.monotonic()
+                    async with proxy_session.get(
+                        TEST_URL, timeout=self._timeout
+                    ) as response:
+                        latency = (time.monotonic() - start_time) * 1000  # in ms
 
-                    if response.status == 200:
-                        anonymity = await self._get_anonymity(self._session)
-                        geolocation = await self._get_geolocation()
-                        return ValidationResult(
-                            proxy=self._proxy,
-                            is_working=True,
-                            latency=latency,
-                            anonymity=anonymity,
-                            geolocation=geolocation,
-                        )
-                    else:
-                        return self._create_error_result(
-                            f"HTTP Status {response.status}"
-                        )
+                        if response.status == 200:
+                            anonymity = await self._get_anonymity(proxy_session)
+                            # Geolocation must be checked with a direct connection
+                            geolocation = await self._get_geolocation()
+                            return ValidationResult(
+                                proxy=self._proxy,
+                                is_working=True,
+                                latency=latency,
+                                anonymity=anonymity,
+                                geolocation=geolocation,
+                            )
+                        else:
+                            return self._create_error_result(
+                                f"HTTP Status {response.status}"
+                            )
 
-            except (ClientConnectorError, asyncio.TimeoutError, ClientError) as e:
+            except (ClientConnectorError, asyncio.TimeoutError, ClientError):
                 # Continue to the next protocol if one fails
                 continue
             except Exception as e:
@@ -88,8 +92,9 @@ class ProxyValidator:
         if not self._my_ip:
             return "Unknown"
         try:
+            # The session is already using the proxy, so no 'proxy' param needed
             async with proxy_session.get(
-                ANONYMITY_TEST_URL, timeout=self._timeout, proxy=str(self._proxy)
+                ANONYMITY_TEST_URL, timeout=self._timeout
             ) as response:
                 if response.status == 200:
                     data = await response.json()

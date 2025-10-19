@@ -1,10 +1,10 @@
 """Main entry point for the Asynchronous Proxy Checker."""
 
-import argparse
 import asyncio
 import logging
 import sys
 from typing import List, Optional
+import argparse
 from aiohttp import ClientSession
 
 from .config import (
@@ -157,16 +157,26 @@ async def main() -> None:
             validator = ProxyValidator(session, proxy, my_ip, args.timeout)
             tasks.append(asyncio.create_task(validator.check()))
 
-        results: list[ValidationResult] = await asyncio.gather(*tasks)
+        results: list[ValidationResult] = await asyncio.gather(
+            *tasks, return_exceptions=True
+        )
+
+    # Process results, separating successful ones from exceptions
+    processed_results: List[ValidationResult] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logging.error(f"An error occurred during validation: {result}")
+        elif result:
+            processed_results.append(result)
 
     # Handle output
     if args.output:
         with open(args.output, "w") as f:
             writer = get_writer(args.format, f)
-            writer.write(results)
+            writer.write(processed_results)
     else:
         writer = get_writer(args.format, sys.stdout)
-        writer.write(results)
+        writer.write(processed_results)
 
 
 def run() -> None:
