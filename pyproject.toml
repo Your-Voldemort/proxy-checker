@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-proxy-checker"
+version = "1.0.0"
+authors = [
+    { name="Kilo Code", email="kilo.code@example.com" },
+]
+description = "A fast, asynchronous proxy checker and validator with support for HTTP, SOCKS, and flexible output formats."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: Proxy Servers",
+]
+dependencies = [
+    "aiohttp>=3.8.0",
+    "aiohttp-socks>=0.7.0",
+    "aiodns>=3.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/example/proxy-checker"
+"Bug Tracker" = "https://github.com/example/proxy-checker/issues"
+
+[project.scripts]
+proxy-checker = "proxy_checker.main:run"
