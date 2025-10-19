@@ -1,11 +1,10 @@
 """Main entry point for the Asynchronous Proxy Checker."""
 
 import argparse
-import argparse
 import asyncio
 import logging
 import sys
-from typing import List
+from typing import List, Optional
 from aiohttp import ClientSession
 
 from .config import (
@@ -161,13 +160,13 @@ async def main() -> None:
         results: list[ValidationResult] = await asyncio.gather(*tasks)
 
     # Handle output
-    output_file = open(args.output, "w") if args.output else sys.stdout
-    try:
-        writer = get_writer(args.format, output_file)
+    if args.output:
+        with open(args.output, "w") as f:
+            writer = get_writer(args.format, f)
+            writer.write(results)
+    else:
+        writer = get_writer(args.format, sys.stdout)
         writer.write(results)
-    finally:
-        if output_file is not sys.stdout:
-            output_file.close()
 
 
 def run() -> None:

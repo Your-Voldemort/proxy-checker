@@ -51,54 +51,61 @@ class ProxyValidator:
             connector = self._create_connector()
 
             try:
-                async with ClientSession(connector=connector) as proxy_session:
-                    start_time = time.monotonic()
-                    async with proxy_session.get(
-                        TEST_URL, timeout=self._timeout
-                    ) as response:
-                        latency = (time.monotonic() - start_time) * 1000  # in ms
+                start_time = time.monotonic()
+                async with self._session.get(
+                    TEST_URL, timeout=self._timeout, proxy=str(self._proxy)
+                ) as response:
+                    latency = (time.monotonic() - start_time) * 1000  # in ms
 
-                        if response.status == 200:
-                            anonymity = await self._get_anonymity(proxy_session)
-                            geolocation = await self._get_geolocation()
-                            return ValidationResult(
-                                proxy=self._proxy,
-                                is_working=True,
-                                latency=latency,
-                                anonymity=anonymity,
-                                geolocation=geolocation,
-                            )
-                        else:
-                            return self._create_error_result(
-                                f"HTTP Status {response.status}"
-                            )
+                    if response.status == 200:
+                        anonymity = await self._get_anonymity(self._session)
+                        geolocation = await self._get_geolocation()
+                        return ValidationResult(
+                            proxy=self._proxy,
+                            is_working=True,
+                            latency=latency,
+                            anonymity=anonymity,
+                            geolocation=geolocation,
+                        )
+                    else:
+                        return self._create_error_result(
+                            f"HTTP Status {response.status}"
+                        )
 
             except (ClientConnectorError, asyncio.TimeoutError, ClientError) as e:
                 # Continue to the next protocol if one fails
                 continue
             except Exception as e:
                 # Catch any other unexpected errors
+                logging.debug(f"Unexpected validation error for {self._proxy}: {e}")
                 return self._create_error_result(f"Unexpected error: {e}")
 
         # If all protocols failed
         return self._create_error_result("All protocols failed")
 
-    def _create_connector(self) -> ProxyConnector:
-        """Creates a ProxyConnector from the proxy details."""
-        return ProxyConnector.from_url(str(self._proxy))
-
     async def _get_anonymity(self, proxy_session: ClientSession) -> str:
         """Determines the anonymity level of the proxy."""
+        if not self._my_ip:
+            return "Unknown"
         try:
-            async with proxy_session.get(ANONYMITY_TEST_URL, timeout=self._timeout) as response:
+            async with proxy_session.get(
+                ANONYMITY_TEST_URL, timeout=self._timeout, proxy=str(self._proxy)
+            ) as response:
                 if response.status == 200:
                     data = await response.json()
                     headers = {h.lower() for h in data.get("headers", {})}
-                    origin_ips = {ip.strip() for ip in data.get("origin", "").split(",")}
-                    
+                    origin_ips = {
+                        ip.strip() for ip in data.get("origin", "").split(",")
+                    }
+
                     proxy_headers: Set[str] = {
-                        "via", "forwarded", "x-forwarded-for", "x-forwarded-host",
-                        "x-forwarded-proto", "x-proxy-id", "proxy-connection",
+                        "via",
+                        "forwarded",
+                        "x-forwarded-for",
+                        "x-forwarded-host",
+                        "x-forwarded-proto",
+                        "x-proxy-id",
+                        "proxy-connection",
                     }
 
                     if self._my_ip in origin_ips:
@@ -106,7 +113,8 @@ class ProxyValidator:
                     if not proxy_headers.intersection(headers):
                         return "Elite"
                     return "Anonymous"
-        except Exception:
+        except Exception as e:
+            logging.debug(f"Anonymity check failed for {self._proxy}: {e}")
             return "Unknown"
         return "Unknown"
 
@@ -120,7 +128,8 @@ class ProxyValidator:
                         country = data.get("country", "N/A")
                         city = data.get("city", "N/A")
                         return f"{city}, {country}"
-        except Exception:
+        except Exception as e:
+            logging.debug(f"Geolocation check failed for {self._proxy}: {e}")
             return "Unknown"
         return "Unknown"
 
