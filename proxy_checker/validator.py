@@ -6,8 +6,11 @@ import time
 from typing import Optional, Set
 
 from aiohttp import ClientSession, ClientTimeout
-from aiohttp.client_exceptions import ClientConnectorError, ClientError
-from aiohttp_socks import ProxyConnector
+from aiohttp.client_exceptions import (
+    ClientConnectorError,
+    ClientError,
+    ProxyConnectionError,
+)
 
 from .config import ANONYMITY_TEST_URL, DEFAULT_TIMEOUT, GEO_API_URL, TEST_URL
 from .models import Proxy, ValidationResult
@@ -49,35 +52,39 @@ class ProxyValidator:
 
         for protocol in protocols_to_try:
             self._proxy.protocol = protocol
-            connector = ProxyConnector.from_url(str(self._proxy))
+            proxy_url = str(self._proxy)
 
             try:
-                # Create a new session for each attempt to ensure proper protocol handling
-                async with ClientSession(connector=connector) as proxy_session:
-                    start_time = time.monotonic()
-                    async with proxy_session.get(
-                        TEST_URL, timeout=self._timeout
-                    ) as response:
-                        latency = (time.monotonic() - start_time) * 1000  # in ms
+                start_time = time.monotonic()
+                async with self._session.get(
+                    TEST_URL, timeout=self._timeout, proxy=proxy_url
+                ) as response:
+                    latency = (time.monotonic() - start_time) * 1000  # in ms
 
-                        if response.status == 200:
-                            anonymity = await self._get_anonymity(proxy_session)
-                            # Geolocation must be checked with a direct connection
-                            geolocation = await self._get_geolocation()
-                            return ValidationResult(
-                                proxy=self._proxy,
-                                is_working=True,
-                                latency=latency,
-                                anonymity=anonymity,
-                                geolocation=geolocation,
-                            )
-                        else:
-                            return self._create_error_result(
-                                f"HTTP Status {response.status}"
-                            )
+                    if response.status == 200:
+                        anonymity = await self._get_anonymity(proxy_url)
+                        # Geolocation must be checked with a direct connection
+                        geolocation = await self._get_geolocation()
+                        return ValidationResult(
+                            proxy=self._proxy,
+                            is_working=True,
+                            latency=latency,
+                            anonymity=anonymity,
+                            geolocation=geolocation,
+                        )
+                    else:
+                        return self._create_error_result(
+                            f"HTTP Status {response.status}"
+                        )
 
-            except (ClientConnectorError, asyncio.TimeoutError, ClientError):
+            except (
+                ProxyConnectionError,
+                ClientConnectorError,
+                asyncio.TimeoutError,
+                ClientError,
+            ) as e:
                 # Continue to the next protocol if one fails
+                logging.debug(f"Protocol {protocol} for {self._proxy} failed: {e}")
                 continue
             except Exception as e:
                 # Catch any other unexpected errors
@@ -87,14 +94,14 @@ class ProxyValidator:
         # If all protocols failed
         return self._create_error_result("All protocols failed")
 
-    async def _get_anonymity(self, proxy_session: ClientSession) -> str:
+    async def _get_anonymity(self, proxy_url: str) -> str:
         """Determines the anonymity level of the proxy."""
         if not self._my_ip:
             return "Unknown"
         try:
             # The session is already using the proxy, so no 'proxy' param needed
-            async with proxy_session.get(
-                ANONYMITY_TEST_URL, timeout=self._timeout
+            async with self._session.get(
+                ANONYMITY_TEST_URL, timeout=self._timeout, proxy=proxy_url
             ) as response:
                 if response.status == 200:
                     data = await response.json()

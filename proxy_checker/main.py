@@ -5,6 +5,7 @@ import logging
 import sys
 from typing import List, Optional
 import argparse
+import re
 from aiohttp import ClientSession
 
 from .config import (
@@ -19,43 +20,51 @@ from .writers import get_writer
 
 
 def parse_proxy_string(proxy_str: str) -> Optional[Proxy]:
-    """Parses a proxy string into a Proxy object."""
-    if "://" in proxy_str:
-        # Handle URL format like http://user:pass@host:port
-        try:
-            parts = proxy_str.split("://")
-            protocol: str = parts[0]
-            auth_host_port: str = parts[1]
+    """
+    Parses a proxy string into a Proxy object.
 
-            if "@" in auth_host_port:
-                auth, host_port = auth_host_port.split("@")
-                username, password = auth.split(":")
-                host, port_str = host_port.split(":")
-            else:
-                username, password = None, None
-                host, port_str = auth_host_port.split(":")
+    Supports the following formats:
+    - protocol://user:pass@host:port
+    - protocol://host:port
+    - host:port:user:pass
+    - host:port
+    """
+    proxy_str = proxy_str.strip()
+    
+    # Regex for protocol://user:pass@host:port or protocol://host:port
+    url_pattern = re.compile(
+        r"^(?P<protocol>\w+)://(?:(?P<username>\w+):(?P<password>\w+)@)?"
+        r"(?P<host>[^:]+):(?P<port>\d+)$"
+    )
+    
+    # Regex for host:port:user:pass or host:port
+    host_port_pattern = re.compile(
+        r"^(?P<host>[^:]+):(?P<port>\d+)"
+        r"(?::(?P<username>\w+):(?P<password>\w+))?$"
+    )
 
-            return Proxy(
-                protocol=protocol,
-                host=host,
-                port=int(port_str),
-                username=username,
-                password=password,
-            )
-        except ValueError:
-            return None
-    else:
-        # Handle host:port:user:pass or host:port format
-        parts: list[str] = proxy_str.strip().split(":")
-        if len(parts) == 2:
-            return Proxy(host=parts[0], port=int(parts[1]))
-        elif len(parts) == 4:
-            return Proxy(
-                host=parts[0],
-                port=int(parts[1]),
-                username=parts[2],
-                password=parts[3],
-            )
+    match = url_pattern.match(proxy_str)
+    if match:
+        parts = match.groupdict()
+        return Proxy(
+            protocol=parts.get("protocol"),
+            host=parts["host"],
+            port=int(parts["port"]),
+            username=parts.get("username"),
+            password=parts.get("password"),
+        )
+
+    match = host_port_pattern.match(proxy_str)
+    if match:
+        parts = match.groupdict()
+        return Proxy(
+            host=parts["host"],
+            port=int(parts["port"]),
+            username=parts.get("username"),
+            password=parts.get("password"),
+        )
+        
+    logging.debug(f"Could not parse proxy string: {proxy_str}")
     return None
 
 

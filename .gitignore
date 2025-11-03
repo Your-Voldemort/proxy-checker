@@ -1,3 +1,6 @@
 .kilocode
 working_proxies
 proxies.txt
+./proxy
+
+.venv/
