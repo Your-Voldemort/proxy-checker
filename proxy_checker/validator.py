@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Optional, Set
+from typing import Dict, List, Optional, Set
 
 from aiohttp import ClientSession, ClientTimeout
 from aiohttp.client_exceptions import (
@@ -11,9 +11,16 @@ from aiohttp.client_exceptions import (
     ClientError,
     ProxyConnectionError,
 )
+from aiohttp_socks import ProxyConnector
 
-from .config import ANONYMITY_TEST_URL, DEFAULT_TIMEOUT, GEO_API_URL, TEST_URL
-from .models import Proxy, ValidationResult
+from .config import (
+    ANONYMITY_TEST_URL,
+    DEFAULT_TIMEOUT,
+    GEO_API_URL,
+    TEST_URL,
+    USER_AGENTS,
+)
+from .models import Geolocation, Proxy, ValidationResult
 
 
 class ProxyValidator:
@@ -25,6 +32,7 @@ class ProxyValidator:
         proxy: Proxy,
         my_ip: str,
         timeout: int = DEFAULT_TIMEOUT,
+        test_urls: Optional[List[str]] = None,
     ):
         """
         Initializes the validator.
@@ -34,11 +42,14 @@ class ProxyValidator:
             proxy: The proxy to be validated.
             my_ip: The user's real IP for anonymity checks.
             timeout: The request timeout in seconds.
+            test_urls: A list of URLs to test the proxy against.
         """
         self._session: ClientSession = session
         self._proxy: Proxy = proxy
         self._my_ip: str = my_ip
         self._timeout: ClientTimeout = ClientTimeout(total=timeout)
+        self._test_urls: List[str] = test_urls or []
+        self._user_agent_cycle = iter(USER_AGENTS)
 
     async def check(self) -> ValidationResult:
         """
@@ -47,35 +58,39 @@ class ProxyValidator:
         protocols_to_try: list[str] = (
             [self._proxy.protocol]
             if self._proxy.protocol
-            else ["http", "https", "socks4", "socks5"]
+            else ["socks5", "socks4", "https", "http"]
         )
 
         for protocol in protocols_to_try:
             self._proxy.protocol = protocol
-            proxy_url = str(self._proxy)
+            connector = self._get_connector(protocol)
 
             try:
                 start_time = time.monotonic()
                 async with self._session.get(
-                    TEST_URL, timeout=self._timeout, proxy=proxy_url
+                    TEST_URL, timeout=self._timeout, connector=connector
                 ) as response:
                     latency = (time.monotonic() - start_time) * 1000  # in ms
 
                     if response.status == 200:
-                        anonymity = await self._get_anonymity(proxy_url)
-                        # Geolocation must be checked with a direct connection
+                        anonymity = await self._get_anonymity(connector)
                         geolocation = await self._get_geolocation()
+                        website_tests = await self._test_custom_urls(connector)
+
                         return ValidationResult(
                             proxy=self._proxy,
                             is_working=True,
+                            protocol=protocol,
                             latency=latency,
                             anonymity=anonymity,
                             geolocation=geolocation,
+                            website_tests=website_tests,
                         )
                     else:
-                        return self._create_error_result(
-                            f"HTTP Status {response.status}"
+                        logging.debug(
+                            f"Protocol {protocol} for {self._proxy} failed with status {response.status}"
                         )
+                        continue
 
             except (
                 ProxyConnectionError,
@@ -83,25 +98,30 @@ class ProxyValidator:
                 asyncio.TimeoutError,
                 ClientError,
             ) as e:
-                # Continue to the next protocol if one fails
                 logging.debug(f"Protocol {protocol} for {self._proxy} failed: {e}")
                 continue
             except Exception as e:
-                # Catch any other unexpected errors
-                logging.debug(f"Unexpected validation error for {self._proxy}: {e}")
+                logging.error(f"Unexpected validation error for {self._proxy}: {e}")
                 return self._create_error_result(f"Unexpected error: {e}")
 
-        # If all protocols failed
         return self._create_error_result("All protocols failed")
 
-    async def _get_anonymity(self, proxy_url: str) -> str:
+    def _get_connector(self, protocol: str) -> Optional[ProxyConnector]:
+        """Returns a ProxyConnector for the given protocol, if applicable."""
+        if protocol in ("socks4", "socks5"):
+            return ProxyConnector.from_url(str(self._proxy))
+        return None  # For HTTP/HTTPS, we use the session's proxy parameter
+
+    async def _get_anonymity(self, connector: Optional[ProxyConnector]) -> str:
         """Determines the anonymity level of the proxy."""
         if not self._my_ip:
             return "Unknown"
         try:
-            # The session is already using the proxy, so no 'proxy' param needed
             async with self._session.get(
-                ANONYMITY_TEST_URL, timeout=self._timeout, proxy=proxy_url
+                ANONYMITY_TEST_URL,
+                timeout=self._timeout,
+                connector=connector,
+                proxy=str(self._proxy) if not connector else None,
             ) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -127,28 +147,58 @@ class ProxyValidator:
                     return "Anonymous"
         except Exception as e:
             logging.debug(f"Anonymity check failed for {self._proxy}: {e}")
-            return "Unknown"
         return "Unknown"
 
-    async def _get_geolocation(self) -> str:
+    async def _get_geolocation(self) -> Geolocation:
         """Fetches geolocation data for the proxy's IP address."""
         try:
-            async with self._session.get(f"{GEO_API_URL}{self._proxy.host}", timeout=self._timeout) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get("status") == "success":
-                        country = data.get("country", "N/A")
-                        city = data.get("city", "N/A")
-                        return f"{city}, {country}"
+            # Geolocation lookup should be a direct request, not through the proxy
+            async with ClientSession() as direct_session:
+                async with direct_session.get(
+                    f"{GEO_API_URL}{self._proxy.host}", timeout=self._timeout
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("status") == "success":
+                            return Geolocation(
+                                country=data.get("country", "N/A"),
+                                city=data.get("city", "N/A"),
+                                isp=data.get("isp", "N/A"),
+                            )
         except Exception as e:
             logging.debug(f"Geolocation check failed for {self._proxy}: {e}")
-            return "Unknown"
-        return "Unknown"
+        return Geolocation()
+
+    async def _test_custom_urls(
+        self, connector: Optional[ProxyConnector]
+    ) -> Dict[str, bool]:
+        """Tests the proxy against a list of custom URLs."""
+        results: Dict[str, bool] = {}
+        for url in self._test_urls:
+            try:
+                headers = {"User-Agent": self._get_next_user_agent()}
+                async with self._session.get(
+                    url,
+                    timeout=self._timeout,
+                    connector=connector,
+                    proxy=str(self._proxy) if not connector else None,
+                    headers=headers,
+                ) as response:
+                    results[url] = response.status == 200
+            except Exception:
+                results[url] = False
+        return results
+
+    def _get_next_user_agent(self) -> str:
+        """Cycles through the list of user agents."""
+        try:
+            return next(self._user_agent_cycle)
+        except StopIteration:
+            self._user_agent_cycle = iter(USER_AGENTS)
+            return next(self._user_agent_cycle)
 
     def _create_error_result(self, error_msg: str) -> ValidationResult:
         """Creates a ValidationResult for a failed check."""
         return ValidationResult(
-            proxy=self._proxy,
-            is_working=False,
-            error=error_msg,
+            proxy=self._proxy, is_working=False, error=error_msg
         )

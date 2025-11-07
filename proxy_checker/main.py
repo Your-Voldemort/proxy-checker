@@ -3,69 +3,20 @@
 import asyncio
 import logging
 import sys
-from typing import List, Optional
 import argparse
-import re
+from typing import List
+
 from aiohttp import ClientSession
 
 from .config import (
     DEFAULT_CONCURRENCY,
-    DEFAULT_PROXY_FILE,
     DEFAULT_TIMEOUT,
-    TEST_URL,
 )
-from .models import Proxy
-from .validator import ProxyValidator
-from .writers import get_writer
-
-
-def parse_proxy_string(proxy_str: str) -> Optional[Proxy]:
-    """
-    Parses a proxy string into a Proxy object.
-
-    Supports the following formats:
-    - protocol://user:pass@host:port
-    - protocol://host:port
-    - host:port:user:pass
-    - host:port
-    """
-    proxy_str = proxy_str.strip()
-    
-    # Regex for protocol://user:pass@host:port or protocol://host:port
-    url_pattern = re.compile(
-        r"^(?P<protocol>\w+)://(?:(?P<username>\w+):(?P<password>\w+)@)?"
-        r"(?P<host>[^:]+):(?P<port>\d+)$"
-    )
-    
-    # Regex for host:port:user:pass or host:port
-    host_port_pattern = re.compile(
-        r"^(?P<host>[^:]+):(?P<port>\d+)"
-        r"(?::(?P<username>\w+):(?P<password>\w+))?$"
-    )
-
-    match = url_pattern.match(proxy_str)
-    if match:
-        parts = match.groupdict()
-        return Proxy(
-            protocol=parts.get("protocol"),
-            host=parts["host"],
-            port=int(parts["port"]),
-            username=parts.get("username"),
-            password=parts.get("password"),
-        )
-
-    match = host_port_pattern.match(proxy_str)
-    if match:
-        parts = match.groupdict()
-        return Proxy(
-            host=parts["host"],
-            port=int(parts["port"]),
-            username=parts.get("username"),
-            password=parts.get("password"),
-        )
-        
-    logging.debug(f"Could not parse proxy string: {proxy_str}")
-    return None
+from .models import Proxy, ValidationResult
+from .parsers.proxy_parser import parse_proxy
+from .validation.validator import validate_proxy
+from .writers.csv_writer import CsvWriter
+from .writers.json_writer import JsonWriter
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         "proxy_source",
         nargs="?",
         default=None,
-        help=f"Path to the file containing proxies. If not provided, reads from stdin.",
+        help="Path to the file containing proxies. If not provided, reads from stdin.",
     )
     parser.add_argument(
         "-o",
@@ -112,7 +63,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TIMEOUT,
         help=f"Request timeout in seconds. Defaults to {DEFAULT_TIMEOUT}.",
     )
+    parser.add_argument(
+        "--test-urls",
+        type=str,
+        default=None,
+        help="A comma-separated list of URLs to test proxies against.",
+    )
     return parser.parse_args()
+
 
 async def main() -> None:
     """Main asynchronous function."""
@@ -139,7 +97,9 @@ async def main() -> None:
         proxy_lines = sys.stdin.readlines()
 
     proxies: list[Proxy] = [
-        p for p in [parse_proxy_string(line) for line in proxy_lines if line.strip()] if p is not None
+        p
+        for p in [parse_proxy(line) for line in proxy_lines if line.strip()]
+        if p is not None
     ]
 
     if not proxies:
@@ -147,24 +107,21 @@ async def main() -> None:
         sys.exit(1)
 
     logging.info(f"Found {len(proxies)} proxies to check.")
+    test_urls: List[str] = (
+        [url.strip() for url in args.test_urls.split(",")] if args.test_urls else []
+    )
+    if test_urls:
+        logging.info(f"Testing against custom URLs: {test_urls}")
+
     semaphore = asyncio.Semaphore(args.concurrency)
 
     async with ClientSession() as session:
-        # Get real IP for anonymity checks
-        my_ip: str = ""
-        try:
-            async with session.get(TEST_URL, timeout=args.timeout) as response:
-                data = await response.json()
-                my_ip = data.get("origin", "")
-                logging.info(f"Determined real IP: {my_ip}")
-        except Exception as e:
-            logging.error(f"Could not determine real IP: {e}")
-            my_ip = ""
-
         tasks: list[asyncio.Task] = []
         for proxy in proxies:
-            validator = ProxyValidator(session, proxy, my_ip, args.timeout)
-            tasks.append(asyncio.create_task(validator.check()))
+            task = asyncio.create_task(
+                validate_proxy(proxy, session, test_urls=test_urls)
+            )
+            tasks.append(task)
 
         results: list[ValidationResult] = await asyncio.gather(
             *tasks, return_exceptions=True
@@ -180,12 +137,30 @@ async def main() -> None:
 
     # Handle output
     if args.output:
-        with open(args.output, "w") as f:
-            writer = get_writer(args.format, f)
-            writer.write(processed_results)
-    else:
-        writer = get_writer(args.format, sys.stdout)
+        if args.format == "json":
+            writer = JsonWriter(args.output)
+        elif args.format == "csv":
+            writer = CsvWriter(args.output)
+        else:
+            # Simple text writer
+            with open(args.output, "w") as f:
+                for result in processed_results:
+                    if result.is_working:
+                        f.write(f"{result.proxy}\n")
+            return
         writer.write(processed_results)
+    else:
+        if args.format == "json":
+            # Can't write json to stdout without a proper writer
+            print(
+                "JSON output to stdout is not supported. Please use a file with -o."
+            )
+        elif args.format == "csv":
+            print("CSV output to stdout is not supported. Please use a file with -o.")
+        else:
+            for result in processed_results:
+                if result.is_working:
+                    print(result.proxy)
 
 
 def run() -> None:
@@ -196,6 +171,7 @@ def run() -> None:
         logging.info("\nInterrupted by user. Exiting.")
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+
 
 if __name__ == "__main__":
     run()
