@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sys
 import argparse
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import List
 
 from aiohttp import ClientSession
@@ -13,8 +15,10 @@ from .config import (
     DEFAULT_TIMEOUT,
 )
 from .models import Proxy, ValidationResult
+from .exceptions import ProxyParsingError
 from .parsers.proxy_parser import parse_proxy
-from .validation.validator import validate_proxy
+from .utils.http_client import get_my_ip
+from .validator import ProxyValidator
 from .writers.csv_writer import CsvWriter
 from .writers.json_writer import JsonWriter
 
@@ -71,10 +75,141 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+def validate_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Validate command-line arguments."""
+
+    # Validate concurrency
+    if args.concurrency <= 0:
+        logging.error(f"Concurrency must be positive, got: {args.concurrency}")
+        sys.exit(1)
+    if args.concurrency > 1000:
+        logging.warning(
+            f"Concurrency of {args.concurrency} is very high. "
+            f"Consider using a lower value to avoid resource exhaustion."
+        )
+
+    # Validate timeout
+    if args.timeout <= 0:
+        logging.error(f"Timeout must be positive, got: {args.timeout}")
+        sys.exit(1)
+    if args.timeout > 300:
+        logging.warning(
+            f"Timeout of {args.timeout}s is very high. "
+            f"This may cause long wait times."
+        )
+
+    # Validate test URLs
+    if args.test_urls:
+        urls = [url.strip() for url in args.test_urls.split(",")]
+        validated_urls = []
+
+        for url in urls:
+            try:
+                parsed = urlparse(url)
+                if parsed.scheme not in ("http", "https"):
+                    logging.error(
+                        f"Invalid URL scheme '{parsed.scheme}' in {url}. "
+                        f"Only http and https are supported."
+                    )
+                    sys.exit(1)
+                if not parsed.netloc:
+                    logging.error(f"Invalid URL format: {url}")
+                    sys.exit(1)
+                validated_urls.append(url)
+            except Exception as e:
+                logging.error(f"Invalid URL '{url}': {e}")
+                sys.exit(1)
+
+        args.test_urls = ",".join(validated_urls)
+
+    # Validate output path
+    if args.output:
+        output_path = Path(args.output)
+        if output_path.exists() and not output_path.is_file():
+            logging.error(f"Output path exists and is not a file: {args.output}")
+            sys.exit(1)
+        # Check if directory is writable
+        output_dir = output_path.parent
+        if not output_dir.exists():
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                logging.error(f"Cannot create output directory: {output_dir}")
+                sys.exit(1)
+
+    # Validate proxy source
+    if args.proxy_source:
+        source_path = Path(args.proxy_source)
+        if not source_path.exists():
+            logging.error(f"Proxy file not found: {args.proxy_source}")
+            sys.exit(1)
+        if not source_path.is_file():
+            logging.error(f"Proxy source is not a file: {args.proxy_source}")
+            sys.exit(1)
+
+    return args
+
+class ProgressTracker:
+    """Track and display validation progress."""
+
+    def __init__(self, total: int, verbose: bool = False):
+        self.total = total
+        self.completed = 0
+        self.working = 0
+        self.failed = 0
+        self.verbose = verbose
+        self._lock = asyncio.Lock()
+
+    async def update(self, is_working: bool) -> None:
+        """Update progress counters."""
+        async with self._lock:
+            self.completed += 1
+            if is_working:
+                self.working += 1
+            else:
+                self.failed += 1
+
+            if not self.verbose and sys.stdout.isatty():
+                # Show progress bar in non-verbose mode
+                progress = (self.completed / self.total) * 100
+                bar_length = 40
+                filled = int(bar_length * self.completed / self.total)
+                bar = "=" * filled + "-" * (bar_length - filled)
+
+                print(
+                    f"\rProgress: [{bar}] {progress:.1f}% "
+                    f"({self.completed}/{self.total}) - "
+                    f"Working: {self.working} Failed: {self.failed}",
+                    end="",
+                    flush=True,
+                )
+            elif self.verbose and self.completed % 10 == 0:
+                logging.info(
+                    f"Progress: {self.completed}/{self.total} proxies checked"
+                )
+
+    def finish(self) -> None:
+        """Print final newline."""
+        if not self.verbose and sys.stdout.isatty():
+            print()  # New line after progress bar
+
+
+async def validate_with_progress(
+    validator: ProxyValidator,
+    semaphore: asyncio.Semaphore,
+    progress: ProgressTracker,
+) -> ValidationResult:
+    """Validate proxy and update progress."""
+    async with semaphore:
+        result = await validator.check()
+        await progress.update(result.is_working)
+        return result
+
 
 async def main() -> None:
     """Main asynchronous function."""
     args: argparse.Namespace = parse_args()
+    args = validate_args(args)  # Add validation
 
     # Configure logging
     log_level: int = logging.DEBUG if args.verbose else logging.INFO
@@ -96,11 +231,17 @@ async def main() -> None:
         logging.info("Reading proxies from stdin")
         proxy_lines = sys.stdin.readlines()
 
-    proxies: list[Proxy] = [
-        p
-        for p in [parse_proxy(line) for line in proxy_lines if line.strip()]
-        if p is not None
-    ]
+    proxies: list[Proxy] = []
+    for line in proxy_lines:
+        if not line.strip():
+            continue
+        try:
+            proxy = parse_proxy(line)
+            proxies.append(proxy)
+        except ProxyParsingError as e:
+            if args.verbose:
+                logging.warning(f"Skipping invalid proxy: {e}")
+            continue
 
     if not proxies:
         logging.warning("No valid proxies found. Exiting.")
@@ -113,19 +254,33 @@ async def main() -> None:
     if test_urls:
         logging.info(f"Testing against custom URLs: {test_urls}")
 
+    # Get user's real IP for anonymity checks
+    my_ip = await get_my_ip()
+    if not my_ip:
+        logging.warning("Could not detect real IP. Anonymity checks will be skipped.")
+
+    # Create progress tracker
+    progress = ProgressTracker(total=len(proxies), verbose=args.verbose)
+
     semaphore = asyncio.Semaphore(args.concurrency)
 
     async with ClientSession() as session:
-        tasks: list[asyncio.Task] = []
-        for proxy in proxies:
-            task = asyncio.create_task(
-                validate_proxy(proxy, session, test_urls=test_urls)
+        tasks = [
+            asyncio.create_task(
+                validate_with_progress(
+                    ProxyValidator(
+                        session, proxy, my_ip, args.timeout, test_urls
+                    ),
+                    semaphore,
+                    progress,
+                )
             )
-            tasks.append(task)
+            for proxy in proxies
+        ]
 
-        results: list[ValidationResult] = await asyncio.gather(
-            *tasks, return_exceptions=True
-        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    progress.finish()
 
     # Process results, separating successful ones from exceptions
     processed_results: List[ValidationResult] = []
